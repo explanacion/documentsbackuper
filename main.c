@@ -677,6 +677,8 @@ void createZipfromList()
         if (buf == NULL)
         {
             printf("Error while allocating memory for a buf variable\n");
+            fclose(lfp);
+            free(line);
             return;
         }
 
