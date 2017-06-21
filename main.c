@@ -35,6 +35,8 @@ myconfig defconfig = { "C:\\", 26, 0, { "doc", "pdf", "djvu", "7z", "bat", "bmp"
 FILE *fp; // settings file
 FILE *tempfp; // temporary list of files ready to be in a zip
 
+int cnt=0;
+
 int file_exist(LPCTSTR fname)
 {
     if (GetFileAttributesW(fname) != (DWORD)-1)
@@ -111,7 +113,7 @@ size_t getwline(wchar_t **lineptr, size_t *n, FILE *stream) {
     wchar_t *bufptr = NULL;
     wchar_t *p = bufptr;
     size_t size;
-    wint_t c;
+    int c;
 
     if (lineptr == NULL) {
         return -1;
@@ -255,7 +257,9 @@ int countlines(char *tfilepath)
     return lines;
 }
 
-void loadsettings()
+// load configuration settings from a file
+// return values: -1 error, 0 - success, 1 - no config file, generate one
+int loadsettings()
 {
     if (file_exist(TEXT(SETTINGSFILE)))
     {
@@ -270,14 +274,14 @@ void loadsettings()
 
         if (defconfig.extensions == NULL) {
             printf("Error during allocation of memory for an array of strings which contains the settings");
-            return;
+            return -1;
         }
         // read the config file and allocate memory to store the settings
         while ((read = getline(&line, &len, fp)) != -1) {
             if (line == NULL)
             {
                 printf("Error. The pointer line isn't initialized.\n");
-                return;
+                return -1;
             }
             line[read] = '\0';
             //printf("%s\n",line);
@@ -308,9 +312,11 @@ void loadsettings()
         //}
 
         fclose(fp);
+        return 0;
     }
     else {
         createdefaultconfigfile();
+        return 1;
     }
 }
 
@@ -441,25 +447,21 @@ void scanfiles(wchar_t *wstart_path)
     return;
 }
 
-// f - name of file to get info on, tmzip - return value: access, modific. and creation times, dt - dostime
-uLong filetime(wchar_t *f, uLong *dt)
+uint32_t get_file_date(const wchar_t *path, uint32_t *dos_date)
 {
-    int ret = 0;
-    {
-        FILETIME ftLocal;
-        HANDLE hFind;
-        WIN32_FIND_DATAW ff32;
-
-        hFind = FindFirstFileW(f,&ff32);
-        if (hFind != INVALID_HANDLE_VALUE)
-        {
-            FileTimeToLocalFileTime(&(ff32.ftLastWriteTime),&ftLocal);
-            FileTimeToDosDateTime(&ftLocal,((LPWORD)dt)+1,((LPWORD)dt)+0);
-            FindClose(hFind);
-            ret=1;
-        }
-    }
-    return ret;
+     int ret = 0;
+     FILETIME ftm_local;
+     HANDLE find = NULL;
+     WIN32_FIND_DATAA ff32;
+     find = FindFirstFileW(path, &ff32);
+     if (find != INVALID_HANDLE_VALUE)
+     {
+         FileTimeToLocalFileTime(&(ff32.ftLastWriteTime), &ftm_local);
+         FileTimeToDosDateTime(&ftm_local, ((LPWORD)dos_date) + 1, ((LPWORD)dos_date) + 0);
+         FindClose(find);
+         ret = 1;
+     }
+     return ret;
 }
 
 void setwtitle(int percent)
@@ -518,7 +520,7 @@ int fwclsize(wchar_t *filepath) {
 // pathtozip = "C:\\Android\\test.zip"
 zipFile openZip(char *pathtozip) {
     // create empty zip file
-    zipFile zf = zipOpen(pathtozip,APPEND_STATUS_CREATE);
+    zipFile zf = zipOpen64(pathtozip,APPEND_STATUS_CREATE);
     if (zf == NULL) {
         // if something went wrong
         printf("couldn't create empty zip");
@@ -528,114 +530,140 @@ zipFile openZip(char *pathtozip) {
 }
 
 void closeZip(zipFile zf) {
-    zipClose(zf,NULL);
+    zipClose_64(zf,NULL);
+}
+
+int is_large_file(const wchar_t *path)
+{
+    uint64_t pos = fwclsize(path);
+    return (pos >= UINT32_MAX);
+}
+
+int get_file_crc(const wchar_t *path, void *buf, uint32_t size_buf, uint32_t *result_crc)
+{
+    FILE *handle = NULL;
+    uint32_t calculate_crc = 0;
+    uint32_t size_read = 0;
+    int err = 0;
+
+    handle = fopen64(path, "rb, ccs=UTF-8");
+    if (handle == NULL)
+    {
+        err = -1;
+    }
+    else
+    {
+        do
+        {
+            size_read = (int)fread(buf, 1, size_buf, handle);
+
+            if ((size_read < size_buf) && (feof(handle) == 0))
+            {
+                printf("error in reading %s\n", path);
+                err = -1;
+            }
+
+            if (size_read > 0)
+                calculate_crc = (uint32_t)crc32(calculate_crc, buf, size_read);
+        }
+        while ((err == Z_OK) && (size_read > 0));
+        fclose(handle);
+    }
+
+    printf("file %s crc %x\n", path, calculate_crc);
+    *result_crc = calculate_crc;
+    return err;
 }
 
 // zip a file to an open zip archive
 // buf is a memory buffer we allocate before so that we won't need to allocate it for each file
 // buflen is the size of memory buffer we allocate
-// returns the size of the file in case of success or -1 in there was any error
 int addToOpenZip(zipFile zf, wchar_t *pathtofile, char *buf, size_t size_buf)
 {
-    int tlen = wcslen(pathtofile);
-    char s1251[tlen];
-    WideCharToMultiByte(1251, 0, pathtofile, -1, s1251, tlen, NULL, NULL);
-    char *sch;
-    while ((sch=strchr(s1251,'\?')))
-    {
-        *sch='_';
-    }
-
+    int tlen = wcslen(pathtofile); // utf16 length
+    size_t bsize=WideCharToMultiByte(CP_UTF8, 0, pathtofile+3, tlen-3, NULL, 0, NULL, NULL); // utf8 length
+    wchar_t utf8text[bsize+1];
+    wmemset(utf8text,L'\0',bsize);
+    WideCharToMultiByte(CP_UTF8,0,pathtofile+3,tlen-3,utf8text,bsize,NULL,NULL);
+    // the path shouldn't start with a leading slash
 
     // get filename that zip will contain
-    //const char *savefilenameinzip;
-    zip_fileinfo zi;
-    //unsigned long crcFile=0;
-    zi.tmz_date.tm_sec = zi.tmz_date.tm_min = zi.tmz_date.tm_hour =
-            zi.tmz_date.tm_mday = zi.tmz_date.tm_mon
-            = zi.tmz_date.tm_year = 0;
-    zi.dosDate = 0;
-    zi.internal_fa = 0;
-    zi.external_fa = 0;
+    zip_fileinfo zi = { 0 };
+    uint32_t crc_for_crypting = 0;
+    int size_read = 0;
+    int zip64 = 0;
+    int err = ZIP_OK;
+    FILE *fin;
 
-    filetime(pathtofile,&zi.dosDate);
-    // create empty file inside zip
-    // the path shouldn't start with a leading slash
-    while( pathtofile[0] == L'\\' || pathtofile[0] == L'/' )
-    {
-        pathtofile++;
-    }
+    /* Get information about the file on disk so we can store it in zip */
+    get_file_date(pathtofile, &zi.dos_date);
 
-    int err = zipOpenNewFileInZip(zf,s1251,&zi,
-                              NULL,0,NULL,0,NULL, Z_DEFLATED,
-                              Z_NO_COMPRESSION);
+    char *password=NULL;
+
+    if ((password != NULL) && (err == ZIP_OK))
+        err = get_file_crc(utf8text, buf, sizeof(buf), &crc_for_crypting);
+
+    zip64 = is_large_file(pathtofile);
+
+    int level=0;
+
+    err = zipOpenNewFileInZip4_64(zf, utf8text, &zi, NULL, 0, NULL, 0, NULL,
+                                  (level != 0) ? Z_DEFLATED : 0, level, 0,
+                                  -MAX_WBITS, DEF_MEM_LEVEL, Z_DEFAULT_STRATEGY,
+                                  password, crc_for_crypting, 36, 1<<11, zip64);
+
+
 
     //#define Z_NO_COMPRESSION         0
     //#define Z_BEST_SPEED             1
     //#define Z_BEST_COMPRESSION       9
     //#define Z_DEFAULT_COMPRESSION  (-1)
 
-    FILE *fin;
-
-    int fs = 0;
     if (err != ZIP_OK) {
-        wprintf(L"error while opening %s in zipfile\n",pathtofile);
+        wprintf(L"error in opening %s in zipfile (%d)\n", pathtofile, err);
         return -1;
     }
     else {
-        //fin = fopen(pathtofile,"rb");
-        fin = _wfopen(pathtofile,L"rb");
-        if (fin == NULL)
-        {
+        fin = _wfopen(pathtofile, L"rb");
+        if (fin == NULL) {
             err = ZIP_ERRNO;
-            wprintf(L"couldn't open %s on the disk\n",pathtofile);
-            return -1;
+            wprintf(L"error in opening %s for reading\n", pathtofile);
         }
-
-        fs = fsize(fin);
-
     }
-    unsigned long size_read=0;
+
 
     if (err == ZIP_OK)
     {
-        // fill our empty file with the data
-        do {
-            err = ZIP_OK;
-            size_read = (int)fread(buf,1,size_buf,fin);
-            if (size_read < size_buf)
+        /* Read contents of file and write it to zip */
+        do  {
+            size_read = (int)fread(buf, 1, sizeof(buf), fin);
+            if ((size_read < (int)sizeof(buf)) && (feof(fin) == 0))
             {
-                if (feof(fin) == 0)
-                {
-                    wprintf(L"error while reading %s\n",pathtofile);
-                    err = ZIP_ERRNO;
-                }
+                wprintf(L"error in reading %s for reading\n", pathtofile);
+                err = ZIP_ERRNO;
             }
-
-            if (size_read>0)
-            {
-                err = zipWriteInFileInZip(zf,buf,size_read);
-                if (err<0)
-                {
-                    wprintf(L"error while writing %s in the zip",pathtofile);
-                }
+            if (size_read > 0)  {
+                err = zipWriteInFileInZip(zf, buf, size_read);
+                if (err < 0)
+                    wprintf(L"error in writing %s in the zipfile (%d)\n", pathtofile, err);
             }
         } while ((err == ZIP_OK) && (size_read > 0));
-
-        if (fin)
-           fclose(fin);
-        if (err < 0)
-            err = ZIP_ERRNO;
-        else {
-            err = zipCloseFileInZip(zf);
-            if (err != ZIP_OK)
-            {
-                wprintf(L"couldn't close %s in the zip",pathtofile);
-                return -1;
-            }
-        }
     }
-    return fs;
+
+
+    if (fin)
+        fclose(fin);
+    if (err < 0)
+    {
+        err = ZIP_ERRNO;
+    }
+    else {
+        err = zipCloseFileInZip(zf);
+        if (err != ZIP_OK)
+            wprintf(L"error in closing %s in the zipfile (%d)\n", pathtofile, err);
+    }
+
+    return err;
 }
 
 int ansifile_exists(const char *path)
@@ -682,8 +710,6 @@ void createZipfromList()
             return;
         }
 
-        size_t totalsize = 0;
-
         while ((read = getwline(&line, &len, lfp)) != -1) {
             if (line == NULL)
             {
@@ -724,21 +750,7 @@ void createZipfromList()
                 // we have enough memory in the buf
 
                 // check the current zip size
-                newsize = addToOpenZip(zf,line,buf,size_buf);
-                size_t news = totalsize + newsize;
-                if (news > totalsize)
-                {
-                    // overflow safe
-                    totalsize = news;
-                }
-                else {
-                    // overflow, can't write more than 4Gb to standart zip
-                    // close the current zip
-                    closeZip(zf);
-                    // open new zip
-                    zf = openZip(OUTPUTPATH "2");
-                    totalsize = 0;
-                }
+                int tryf = addToOpenZip(zf,line,buf,size_buf);
             }
             else {
                 wprintf(L"Warning! File %s doesn't exist\n",line);
@@ -767,7 +779,6 @@ void w_printf(char *txt)
 
 int main(int argc, char *argv[])
 {
-    //_setmode(_fileno(stdout), _O_U16TEXT);
     setlocale(LC_CTYPE,"RUS");
     // if we received any parameters
     if (argc > 1) {
@@ -783,8 +794,9 @@ int main(int argc, char *argv[])
             return 0;
         }
         // try to parse the config file
-        loadsettings();
-        // chech input argument as a path to a directory
+        if (loadsettings() == -1)
+            exit(-1);
+        // check input argument as a path to a directory
         if (dir_exist(argv[1])) {
             memset(defconfig.startdir,0,BUFSIZ);
             strlcpy(defconfig.startdir,argv[1],sizeof(argv[1]) / sizeof(argv[1][0]));
@@ -792,33 +804,35 @@ int main(int argc, char *argv[])
 
         tempfp = fopen(TMPTXTFILE,"w");
         // scan files
-        printf("Scanning the path...\n");
+        printf("Scanning the path %s...\n",defconfig.startdir);
         int startdirlen = strlen(defconfig.startdir);
         wchar_t wstart_path[startdirlen];
         MultiByteToWideChar(CP_UTF8,0,defconfig.startdir,-1,wstart_path,startdirlen);
         scanfiles(wstart_path);
         fclose(tempfp);
+        printf("Done. Creating a zip archive...\n");
         createZipfromList();
-        // we don't need to release memory because we didn't use it to initialize config
+        printf("Finished. Press any key to exit");
+        // we don't need to release memory here because we didn't use it to initialize config
         // fp is already closed
-
         return 0;
     }
     // no arguments
     // try to parse the config file
-    loadsettings();
+    if (loadsettings() == -1)
+        exit(-1);
     // use our default settings
 
     tempfp = fopen(TMPTXTFILE,"w");
     // scan files
-    printf("Scanning the path...\n");
+    printf("Scanning the path %s...\n",defconfig.startdir);
     int startdirlen = strlen(defconfig.startdir);
     wchar_t wstart_path[startdirlen];
     MultiByteToWideChar(CP_UTF8,0,defconfig.startdir,-1,wstart_path,startdirlen);
     wstart_path[startdirlen]='\0';
     scanfiles(wstart_path);
     fclose(tempfp);
-
+    printf("Done. Creating a zip archive...\n");
     createZipfromList();
 
     // release memory and end the program
@@ -831,7 +845,7 @@ int main(int argc, char *argv[])
         }
         free(defconfig.extensions);
     }
-
+    printf("Finished. Press any key to exit");
     return 0;
 }
 
